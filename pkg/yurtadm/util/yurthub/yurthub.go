@@ -242,6 +242,9 @@ func CleanYurthubHostArtifacts() error {
 	if err := os.RemoveAll(yurthubWorkDirPath); err != nil {
 		return err
 	}
+	if err := os.RemoveAll(yurthubCacheDirPath); err != nil {
+		return err
+	}
 	return nil
 }
 
