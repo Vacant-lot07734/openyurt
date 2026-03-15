@@ -492,24 +492,74 @@ func (m *mockYurtJoinData) Namespace() string {
 	return m.namespace
 }
 
-func TestCheckAndInstallYurthub(t *testing.T) {
+func (m *mockYurtJoinData) YurtHubBinaryUrl() string {
+	return ""
+}
+
+func useTempYurthubHostPaths(t *testing.T) string {
+	t.Helper()
+
 	tempDir := t.TempDir()
-	yurthubExecPath := filepath.Join(tempDir, "yurthub")
+	oldBootstrapConfigPath := yurthubBootstrapConfigPath
+	oldExecStartPath := yurthubExecStartPath
+	oldServiceFilePath := yurthubServiceFilePath
+	oldServiceConfFilePath := yurthubServiceConfFilePath
+	oldWorkDirPath := yurthubWorkDirPath
+
+	yurthubBootstrapConfigPath = filepath.Join(tempDir, "var", "lib", "yurthub", "bootstrap-hub.conf")
+	yurthubExecStartPath = filepath.Join(tempDir, "usr", "local", "bin", "yurthub")
+	yurthubServiceFilePath = filepath.Join(tempDir, "etc", "systemd", "system", "yurthub.service")
+	yurthubServiceConfFilePath = filepath.Join(tempDir, "etc", "systemd", "system", "yurthub.service.d", "10-yurthub.conf")
+	yurthubWorkDirPath = filepath.Join(tempDir, "var", "lib", "yurthub")
+
+	t.Cleanup(func() {
+		yurthubBootstrapConfigPath = oldBootstrapConfigPath
+		yurthubExecStartPath = oldExecStartPath
+		yurthubServiceFilePath = oldServiceFilePath
+		yurthubServiceConfFilePath = oldServiceConfFilePath
+		yurthubWorkDirPath = oldWorkDirPath
+	})
+
+	return tempDir
+}
+
+func newLocalHTTPServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+
+	var ts *httptest.Server
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Skipf("httptest server is unavailable in this environment: %v", r)
+			}
+		}()
+		ts = httptest.NewServer(handler)
+	}()
+
+	return ts
+}
+
+func TestCheckAndInstallYurthub(t *testing.T) {
+	tempDir := useTempYurthubHostPaths(t)
+	yurthubExecPath := filepath.Join(tempDir, "existing-yurthub")
 
 	oldLookPath := lookPath
+	oldDownloadFile := downloadFile
+	oldCopyFile := copyFile
 	defer func() {
 		lookPath = oldLookPath
+		downloadFile = oldDownloadFile
+		copyFile = oldCopyFile
 	}()
 
 	t.Run("Yurthub binary already exists", func(t *testing.T) {
-
 		err := os.WriteFile(yurthubExecPath, []byte("dummy"), 0755)
 		if err != nil {
 			t.Fatalf("Failed to create dummy yurthub binary: %v", err)
 		}
 
 		lookPath = func(file string) (string, error) {
-			if file == constants.YurthubExecStart {
+			if file == yurthubExecStartPath {
 				return yurthubExecPath, nil
 			}
 			return oldLookPath(file)
@@ -522,6 +572,7 @@ func TestCheckAndInstallYurthub(t *testing.T) {
 	})
 
 	t.Run("Yurthub version is empty", func(t *testing.T) {
+		lookPath = oldLookPath
 		err := CheckAndInstallYurthub("")
 		if err == nil {
 			t.Errorf("CheckAndInstallYurthub() should return error for empty version but got nil")
@@ -529,19 +580,30 @@ func TestCheckAndInstallYurthub(t *testing.T) {
 	})
 
 	t.Run("Yurthub binary does not exist", func(t *testing.T) {
-
 		lookPath = func(file string) (string, error) {
-			if file == constants.YurthubExecStart {
-				return "", &os.PathError{}
+			if file == yurthubExecStartPath {
+				return "", &os.PathError{Op: "stat", Path: file, Err: os.ErrNotExist}
 			}
 			return oldLookPath(file)
 		}
 
-		t.Log("In a real environment, if yurthub binary doesn't exist and download fails, an error would be returned")
+		downloadFile = func(url, savePath string, retry int) error {
+			return nil
+		}
+		copyFile = func(src, dest string, mode os.FileMode) error {
+			if dest != yurthubExecStartPath {
+				t.Fatalf("unexpected copy destination: %s", dest)
+			}
+			return nil
+		}
+
+		err := CheckAndInstallYurthub("v1.6.1")
+		assert.NoError(t, err)
 	})
 }
 
 func TestCreateYurthubSystemdService(t *testing.T) {
+	useTempYurthubHostPaths(t)
 
 	mockData := &mockYurtJoinData{
 		serverAddr: "127.0.0.1:6443",
@@ -708,6 +770,8 @@ func TestCheckYurthubServiceHealth_HealthzSuccess(t *testing.T) {
 }
 
 func Test_CreateYurthubSystemdService_StartFails(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
 	mockData := &mockYurtJoinData{
 		serverAddr: "127.0.0.1:6443",
 		nodeRegistration: &joindata.NodeRegistration{
@@ -738,14 +802,22 @@ func Test_CreateYurthubSystemdService_StartFails(t *testing.T) {
 }
 
 func Test_CheckAndInstallYurthub_LookPathErrorCausesDownloadAttempt(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
 	oldLookPath := lookPath
+	oldDownloadFile := downloadFile
 	defer func() { lookPath = oldLookPath }()
+	defer func() { downloadFile = oldDownloadFile }()
 
 	lookPath = func(file string) (string, error) {
-		if file == constants.YurthubExecStart {
+		if file == yurthubExecStartPath {
 			return "", &os.PathError{Op: "stat", Path: file, Err: os.ErrNotExist}
 		}
 		return oldLookPath(file)
+	}
+
+	downloadFile = func(url, savePath string, retry int) error {
+		return errors.New("simulated download failure")
 	}
 
 	err := CheckAndInstallYurthub("v0.0.0-test")
@@ -762,9 +834,19 @@ func Test_SetHubBootstrapConfig_InvalidData_ReturnsError(t *testing.T) {
 }
 
 func Test_CleanHubBootstrapConfig_NoError(t *testing.T) {
+	tempDir := useTempYurthubHostPaths(t)
+	if err := os.MkdirAll(filepath.Dir(yurthubBootstrapConfigPath), 0755); err != nil {
+		t.Fatalf("failed to prepare bootstrap config dir: %v", err)
+	}
+	if err := os.WriteFile(yurthubBootstrapConfigPath, []byte("dummy"), 0644); err != nil {
+		t.Fatalf("failed to prepare bootstrap config file: %v", err)
+	}
+
 	if err := CleanHubBootstrapConfig(); err != nil {
 		t.Fatalf("CleanHubBootstrapConfig() expected no error, got: %v", err)
 	}
+	_, err := os.Stat(filepath.Join(tempDir, "var", "lib", "yurthub", "bootstrap-hub.conf"))
+	assert.True(t, os.IsNotExist(err))
 }
 
 func Test_CheckYurtHubItself_CloudAndYurtNames(t *testing.T) {
@@ -776,6 +858,8 @@ func Test_CheckYurtHubItself_CloudAndYurtNames(t *testing.T) {
 	}
 }
 func Test_CreateYurthubSystemdService_DaemonReloadFails(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
 	mockData := &mockYurtJoinData{
 		serverAddr: "127.0.0.1:6443",
 		nodeRegistration: &joindata.NodeRegistration{
@@ -802,6 +886,8 @@ func Test_CreateYurthubSystemdService_DaemonReloadFails(t *testing.T) {
 }
 
 func Test_CreateYurthubSystemdService_EnableFails(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
 	mockData := &mockYurtJoinData{
 		serverAddr: "127.0.0.1:6443",
 		nodeRegistration: &joindata.NodeRegistration{
@@ -883,30 +969,13 @@ func Test_setYurthubUnitService_TemplateSubstitutionError(t *testing.T) {
 	}
 }
 
-var (
-	osStat     = os.Stat
-	osMkdirAll = os.MkdirAll
-)
-
 func Test_setYurthubMainService_DirCreationFail(t *testing.T) {
-	oldStat := osStat
-	oldMkdirAll := osMkdirAll
-
-	osStat = func(name string) (os.FileInfo, error) {
-		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
+	tempDir := useTempYurthubHostPaths(t)
+	blockerFile := filepath.Join(tempDir, "blocked")
+	if err := os.WriteFile(blockerFile, []byte("dummy"), 0644); err != nil {
+		t.Fatalf("failed to create blocker file: %v", err)
 	}
-
-	osMkdirAll = func(path string, perm os.FileMode) error {
-		if path == filepath.Dir(constants.YurthubServicePath) {
-			return fmt.Errorf("permission denied")
-		}
-		return os.MkdirAll(path, perm)
-	}
-
-	defer func() {
-		osStat = oldStat
-		osMkdirAll = oldMkdirAll
-	}()
+	yurthubServiceFilePath = filepath.Join(blockerFile, "systemd", "yurthub.service")
 
 	err := setYurthubMainService()
 	if err == nil {
@@ -915,6 +984,7 @@ func Test_setYurthubMainService_DirCreationFail(t *testing.T) {
 }
 
 func Test_setYurthubUnitService_DirCreationFail(t *testing.T) {
+	tempDir := useTempYurthubHostPaths(t)
 	mockData := &mockYurtJoinData{
 		serverAddr: "192.0.2.10:6443",
 		nodeRegistration: &joindata.NodeRegistration{
@@ -924,25 +994,11 @@ func Test_setYurthubUnitService_DirCreationFail(t *testing.T) {
 		},
 		namespace: "kube-system",
 	}
-
-	oldStat := osStat
-	oldMkdirAll := osMkdirAll
-
-	osStat = func(name string) (os.FileInfo, error) {
-		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
+	blockerFile := filepath.Join(tempDir, "blocked")
+	if err := os.WriteFile(blockerFile, []byte("dummy"), 0644); err != nil {
+		t.Fatalf("failed to create blocker file: %v", err)
 	}
-
-	osMkdirAll = func(path string, perm os.FileMode) error {
-		if path == filepath.Dir(constants.YurthubServiceConfPath) {
-			return fmt.Errorf("permission denied")
-		}
-		return os.MkdirAll(path, perm)
-	}
-
-	defer func() {
-		osStat = oldStat
-		osMkdirAll = oldMkdirAll
-	}()
+	yurthubServiceConfFilePath = filepath.Join(blockerFile, "systemd", "10-yurthub.conf")
 
 	err := setYurthubUnitService(mockData)
 	if err == nil {
@@ -1007,7 +1063,7 @@ spec:
 }
 
 func Test_CheckYurthubReadyzOnce_RequestFail(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == constants.ServerReadyzURLPath {
 			w.WriteHeader(http.StatusInternalServerError)
 		} else {
@@ -1029,7 +1085,7 @@ func Test_CheckYurthubReadyzOnce_RequestFail(t *testing.T) {
 }
 
 func Test_CheckYurthubReadyzOnce_NonOKResponse(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == constants.ServerReadyzURLPath {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("Not Ready"))
@@ -1090,6 +1146,8 @@ func Test_CheckYurtHubItself_EdgeCases(t *testing.T) {
 }
 
 func Test_CreateYurthubSystemdService_DaemonReloadError(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
 	mockData := &mockYurtJoinData{
 		serverAddr: "127.0.0.1:6443",
 		nodeRegistration: &joindata.NodeRegistration{
@@ -1114,6 +1172,8 @@ func Test_CreateYurthubSystemdService_DaemonReloadError(t *testing.T) {
 }
 
 func Test_CreateYurthubSystemdService_EnableError(t *testing.T) {
+	useTempYurthubHostPaths(t)
+
 	mockData := &mockYurtJoinData{
 		serverAddr: "127.0.0.1:6443",
 		nodeRegistration: &joindata.NodeRegistration{
@@ -1138,7 +1198,7 @@ func Test_CreateYurthubSystemdService_EnableError(t *testing.T) {
 }
 
 func Test_CheckYurthubReadyzOnce_ReadBodyFail(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := newLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == constants.ServerReadyzURLPath {
 			hijacker, ok := w.(http.Hijacker)
 			if !ok {
