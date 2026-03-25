@@ -472,6 +472,7 @@ func newReconcilerForTest(t *testing.T, objs ...client.Object) (*ReconcileYurtNo
 
 	return &ReconcileYurtNodeConversion{
 		Client:           cli,
+		apiReader:        cli,
 		nodeServantImage: "openyurt/node-servant:latest",
 		jobNamespace:     testWorkingNamespace,
 		cfg: conversionconfig.YurtNodeConversionControllerConfiguration{

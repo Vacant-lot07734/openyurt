@@ -27,6 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -67,6 +68,7 @@ type ReconcileYurtNodeConversion struct {
 	cfg              conversionconfig.YurtNodeConversionControllerConfiguration
 	nodeServantImage string
 	jobNamespace     string
+	apiReader        client.Reader
 }
 
 var _ reconcile.Reconciler = &ReconcileYurtNodeConversion{}
@@ -88,6 +90,7 @@ func Add(ctx context.Context, c *appconfig.CompletedConfig, mgr manager.Manager)
 		cfg:              c.ComponentConfig.YurtNodeConversionController,
 		nodeServantImage: c.ComponentConfig.YurtStaticSetController.UpgradeWorkerImage,
 		jobNamespace:     c.ComponentConfig.Generic.WorkingNamespace,
+		apiReader:        mgr.GetAPIReader(),
 	}
 
 	ctrl, err := controller.New(names.YurtNodeConversionController, mgr, controller.Options{
@@ -307,58 +310,71 @@ func (r *ReconcileYurtNodeConversion) handleSuccessfulAction(ctx context.Context
 // ensureNodeUnschedulable keeps the node cordon state aligned with the current
 // conversion phase and is intentionally idempotent
 func (r *ReconcileYurtNodeConversion) ensureNodeUnschedulable(ctx context.Context, nodeName string, unschedulable bool) error {
-	node := &corev1.Node{}
-	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
-		return err
-	}
-	if node.Spec.Unschedulable == unschedulable {
-		return nil
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node := &corev1.Node{}
+		if err := r.nodeReader().Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+			return err
+		}
+		if node.Spec.Unschedulable == unschedulable {
+			return nil
+		}
 
-	before := node.DeepCopy()
-	node.Spec.Unschedulable = unschedulable
-	klog.V(4).Info(Format("patch node(%s) unschedulable=%t", nodeName, unschedulable))
-	return r.Patch(ctx, node, client.MergeFrom(before))
+		before := node.DeepCopy()
+		node.Spec.Unschedulable = unschedulable
+		klog.V(4).Info(Format("patch node(%s) unschedulable=%t", nodeName, unschedulable))
+		return r.Patch(ctx, node, client.MergeFrom(before))
+	})
 }
 
 // ensureEdgeWorkerLabel applies the controller-managed source-of-truth label
 // for the terminal edge/non-edge state and leaves unrelated labels untouched
 func (r *ReconcileYurtNodeConversion) ensureEdgeWorkerLabel(ctx context.Context, nodeName string, enabled bool) error {
-	node := &corev1.Node{}
-	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
-		return err
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node := &corev1.Node{}
+		if err := r.nodeReader().Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+			return err
+		}
 
-	before := node.DeepCopy()
-	if node.Labels == nil {
-		node.Labels = map[string]string{}
-	}
+		before := node.DeepCopy()
+		if node.Labels == nil {
+			node.Labels = map[string]string{}
+		}
 
-	if enabled {
-		node.Labels[projectinfo.GetEdgeWorkerLabelKey()] = "true"
-	} else {
-		delete(node.Labels, projectinfo.GetEdgeWorkerLabelKey())
-	}
+		if enabled {
+			node.Labels[projectinfo.GetEdgeWorkerLabelKey()] = "true"
+		} else {
+			delete(node.Labels, projectinfo.GetEdgeWorkerLabelKey())
+		}
 
-	if reflect.DeepEqual(before.Labels, node.Labels) {
-		return nil
-	}
-	klog.V(4).Info(Format("patch node(%s) %s=%t", nodeName, projectinfo.GetEdgeWorkerLabelKey(), enabled))
-	return r.Patch(ctx, node, client.MergeFrom(before))
+		if reflect.DeepEqual(before.Labels, node.Labels) {
+			return nil
+		}
+		klog.V(4).Info(Format("patch node(%s) %s=%t", nodeName, projectinfo.GetEdgeWorkerLabelKey(), enabled))
+		return r.Patch(ctx, node, client.MergeFrom(before))
+	})
 }
 
 // ensureNodeConversionCondition upserts the single conversion condition that
 // reports round progress and terminal outcome back to users and controllers
 func (r *ReconcileYurtNodeConversion) ensureNodeConversionCondition(ctx context.Context, nodeName string, cond corev1.NodeCondition) error {
-	node := &corev1.Node{}
-	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
-		return err
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node := &corev1.Node{}
+		if err := r.nodeReader().Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+			return err
+		}
+		if !setConversionCondition(node, cond) {
+			return nil
+		}
+		klog.V(4).Info(Format("update node(%s) conversion condition to status=%s reason=%s", nodeName, cond.Status, cond.Reason))
+		return r.Status().Update(ctx, node)
+	})
+}
+
+func (r *ReconcileYurtNodeConversion) nodeReader() client.Reader {
+	if r.apiReader != nil {
+		return r.apiReader
 	}
-	if !setConversionCondition(node, cond) {
-		return nil
-	}
-	klog.V(4).Info(Format("update node(%s) conversion condition to status=%s reason=%s", nodeName, cond.Status, cond.Reason))
-	return r.Status().Update(ctx, node)
+	return r.Client
 }
 
 // desiredActionFromNode derives the next conversion direction from Node labels
